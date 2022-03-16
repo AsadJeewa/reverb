@@ -23,6 +23,9 @@ namespace deepmind::reverb {
 // Inserts an identical item into target table when the item is sampled for the
 // first time from the source table (i.e. the table which owns the extension).
 //
+// NOTE! The item will be inserted into the target table with `times_sampled`
+// set to 1 even though it has been sampled from the target table.
+//
 // NOTE: We assume that all inserts will succeed but if they don't then we'll
 // simply drop the item and log to ERROR.
 class InsertOnSampleExtension : public TableExtensionBase {
@@ -31,8 +34,8 @@ class InsertOnSampleExtension : public TableExtensionBase {
   // `target_table`, throwing away the item to insert. absl::InfiniteDuration()
   // will block on the successful insertion.
   // If `target_table` can block on inserts, prefer using a short timeout.
-  explicit InsertOnSampleExtension(std::shared_ptr<Table> target_table,
-                                   absl::Duration timeout);
+  InsertOnSampleExtension(std::shared_ptr<Table> target_table,
+                          absl::Duration timeout);
 
   // Inserts a copy of the item into the target table.
   void ApplyOnSample(const ExtensionItem& item) override;

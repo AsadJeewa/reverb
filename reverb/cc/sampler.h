@@ -28,6 +28,7 @@
 #include "absl/time/time.h"
 #include "reverb/cc/platform/thread.h"
 #include "reverb/cc/reverb_service.grpc.pb.h"
+#include "reverb/cc/schema.pb.h"
 #include "reverb/cc/support/queue.h"
 #include "reverb/cc/support/signature.h"
 #include "reverb/cc/table.h"
@@ -53,8 +54,7 @@ inline absl::Duration Int64MillisToNonnegativeDuration(int64_t milliseconds) {
 // A sample from the replay buffer.
 class Sample {
  public:
-  Sample(tensorflow::uint64 key, double probability,
-         tensorflow::int64 table_size, double priority, bool rate_limited,
+  Sample(std::shared_ptr<const SampleInfo> info,
          std::vector<std::vector<tensorflow::Tensor>> column_chunks,
          std::vector<bool> squeeze_columns);
 
@@ -62,30 +62,11 @@ class Sample {
   // CHECK-fails if the entire sample has already been returned.
   std::vector<tensorflow::Tensor> GetNextTimestep();
 
-  // Returns the entire sample as a flat sequence of batched tensors.
+  // Returns the trajectory as a flat sequence of tensors representing the
+  // columns of the flattened trajectory.
   //
   // Fails with `DataLossError` if `GetNextTimestep()` has already been called
   // on this sample.
-  // Fails with `FailedPreconditionError` if sample cannot be decomposed into
-  // timestpes.
-  //
-  // Return:
-  //   K+4 tensors each having a leading dimension of size N (= sample
-  //   length). The first four tensors are 1D (length N) tensors representing
-  //   the key, sample probability, table size and priority respectively. The
-  //   last K tensors holds the actual timestep data batched into a tensor of
-  //   shape [N, ...original_shape].
-  absl::Status AsBatchedTimesteps(std::vector<tensorflow::Tensor>* data);
-
-  // Returns the entire sample as a flat sequence of batched tensors.
-  //
-  // Fails with `DataLossError` if `GetNextTimestep()` has already been called
-  // on this sample.
-  //
-  // Return:
-  //   K+4 tensors. The first four tensors are scalar tensors representing
-  //   the key, sample probability, table size and priority respectively. The
-  //   last K tensors holds the actual trajectory data.
   absl::Status AsTrajectory(std::vector<tensorflow::Tensor>* data);
 
   // Returns true if the end of the sample has been reached.
@@ -94,29 +75,14 @@ class Sample {
   // Returns true if the sample can be decomposed into timesteps.
   ABSL_MUST_USE_RESULT bool is_composed_of_timesteps() const;
 
-  // Whether the sample was delayed due to rate limiting or not.
-  bool rate_limited() const;
+  // Metadata info for the sampled item.
+  //
+  // NOTE! `info.item` may not be fully populated. Only `key`, `priority` and
+  // `times_sampled` are guaranteed to be set.
+  std::shared_ptr<const SampleInfo> info() const { return info_; }
 
  private:
-  // Concatenates content of column `i` into `data[i+4]`, i.e ofset by info
-  // columns.
-  absl::Status UnpackColumns(std::vector<tensorflow::Tensor>* data);
-
-  // The key of the replay item this time step was sampled from.
-  tensorflow::uint64 key_;
-
-  // The probability of the replay item this time step was sampled from.
-  double probability_;
-
-  // The size of the replay table this time step was sampled from at the time
-  // of sampling.
-  tensorflow::int64 table_size_;
-
-  // Priority of the replay item this time step was sampled from.
-  double priority_;
-
-  // Whether the sample was delayed due to rate limiting or not.
-  bool rate_limited_;
+  std::shared_ptr<const SampleInfo> info_;
 
   // Total number of time steps in this sample. Only set when
   // `is_timestep_sample()` is true.
@@ -167,10 +133,10 @@ class SamplerWorker {
 // ReverbService. A set of workers, each managing a  bi-directional gRPC stream
 // are created. The workers unpack the responses into samples (sequences of
 // timesteps) which are returned through calls to `GetNextTimestep` and
-// `GetNextSample`.
+// `GetNextTrajectory`.
 //
 // Concurrent calls to `GetNextTimestep` is NOT supported! This includes calling
-// `GetNextSample` and `GetNextTimestep` concurrently.
+// `GetNextTrajectory` and `GetNextTimestep` concurrently.
 //
 // Terminology:
 //   Timestep:
@@ -199,8 +165,8 @@ class SamplerWorker {
 // complete samples. If `GetNextTimestep` is called then a sample is popped from
 // the queue and split into timesteps and the first one returned. Timesteps are
 // then popped one by one until the sample has been completely emitted and the
-// process starts over. Calls to `GetNextSample` skips the timestep splitting
-// and returns samples as a "batch of timesteps".
+// process starts over. Calls to `GetNextTrajectory` skips the timestep
+// splitting and returns samples as a "batch of timesteps".
 //
 class Sampler {
  public:
@@ -221,6 +187,25 @@ class Sampler {
   // By default, only one worker is used as any higher number could lead to
   // incorrect behavior for FIFO samplers.
   static const int kDefaultNumWorkers = 1;
+
+  // ID, probability, table size, priority, times sampled;
+  static const int kNumInfoTensors = 5;
+
+  // Extracts the `kNumInfoTensors` from `info` as scalar tensors and prepends
+  // these fo `data`.
+  //
+  // The metadata fields extracted are:
+  //
+  //   * [uint64] Key of the sampled item.
+  //   * [double] The probability of selecting this item at the time it was
+  //     sampled.
+  //   * [int64] The size of the table when the item was sampled.
+  //   * [double] The priority of the item when it was sampled.
+  //   * [int32] The number of times the item has been sampled (including this
+  //     sample).
+  //
+  static std::vector<tensorflow::Tensor> WithInfoTensors(
+      const SampleInfo& info, std::vector<tensorflow::Tensor> data);
 
   struct Options {
     // `max_samples` is the maximum number of samples the object will return.
@@ -251,7 +236,7 @@ class Sampler {
     //
     // Note that if `num_workers > 1`, then any worker hitting the timeout will
     // lead to the Sampler returning a `DeadlineExceeded` in calls to
-    // `GetNextSample()` and/or `GetNextTimestep()`.
+    // `GetNextTrajectory()` and/or `GetNextTimestep()`.
     //
     // The default is to wait forever - or until the connection closes, or
     // `Close` is called, whichever comes first.
@@ -285,38 +270,32 @@ class Sampler {
 
   // Blocks until a timestep has been retrieved or until a non transient error
   // is encountered or `Close` has been called.
-  absl::Status GetNextTimestep(std::vector<tensorflow::Tensor>* data,
-                               bool* end_of_sequence,
-                               bool* rate_limited = nullptr);
-
-  // Blocks until a complete (timestep sequence) sample has been retrieved or
-  // until a non transient error is encountered or `Close` has been called.
   //
-  // Once the sample has been retrieved then the data is unpacked as "batched
-  // timesteps". That is, for a timestep trajectory of length N, the result is
-  // the same as calling `GetNextTimestep` N times and then concatenating the
-  // results column wise.
+  // `data` is populated with the next timestep of the sampled item. When the
+  // the last timestep of the item is returned `end_of_sequence` is set to
+  // `true`.
   //
-  // TODO(b/179118872): Remove this method and just use GetNextTrajectory.
-  absl::Status GetNextSample(std::vector<tensorflow::Tensor>* data,
-                             bool* rate_limited = nullptr);
+  // NOTE! `info.item` may not be fully populated. Only `key`, `priority` and
+  // `times_sampled` are guaranteed to be set.
+  absl::Status GetNextTimestep(
+      std::vector<tensorflow::Tensor>* data, bool* end_of_sequence,
+      std::shared_ptr<const SampleInfo>* info = nullptr);
 
   // Blocks until a complete sample has been retrieved or until a non transient
   // error is encountered or `Close` has been called.
   //
-  // Once the sample has been retrieved then the sample is unpacked into 4+K
-  // tensors. The first 4 tensors are scalars representig the key, probability,
-  // table size and priority of the sample. The remaining K tensors are the
-  // columns of the flattened trajectory.
+  // `data` is populated with the full (flattened) trajectory represented by
+  // the sampled item.
   //
-  // TODO(b/179118872): Rename this to GetNextSample once the existing method
-  //   has been deleted.
-  absl::Status GetNextTrajectory(std::vector<tensorflow::Tensor>* data,
-                                 bool* rate_limited = nullptr);
+  // NOTE! `info.item` may not be fully populated. Only `key`, `priority` and
+  // `times_sampled` are guaranteed to be set.
+  absl::Status GetNextTrajectory(
+      std::vector<tensorflow::Tensor>* data,
+      std::shared_ptr<const SampleInfo>* info = nullptr);
 
   // Cancels all workers and joins their threads. Any blocking or future call
-  // to `GetNextTimestep` or `GetNextSample` will return CancelledError without
-  // blocking.
+  // to `GetNextTimestep` or `GetNextTrajectory` will return CancelledError
+  // without blocking.
   void Close();
 
   // Sampler is neither copyable nor movable.
@@ -327,22 +306,8 @@ class Sampler {
   Sampler(std::vector<std::unique_ptr<SamplerWorker>>, const std::string& table,
           const Options& options, internal::DtypesAndShapes dtypes_and_shapes);
 
-  // Validates the `data` vector against `dtypes_and_shapes`.
-  enum class ValidationMode {
-    // `GetNextTimestep` is the caller. The signature represents a single
-    // timestep and so do does the provided data.
-    kTimestep,
-
-    // `GetNextSample` is the caller. The signature represents a single timestep
-    // and the data is a sequence of batched timesteps.
-    kBatchedTimestep,
-
-    // `GetNextTrajectory` is the caller. The signature represents a complete
-    // trajectory and so does the data.
-    kTrajectory,
-  };
   absl::Status ValidateAgainstOutputSpec(
-      const std::vector<tensorflow::Tensor>& data, ValidationMode mode);
+      const std::vector<tensorflow::Tensor>& data);
 
   void RunWorker(SamplerWorker* worker) ABSL_LOCKS_EXCLUDED(mu_);
 
@@ -353,7 +318,8 @@ class Sampler {
   // Blocks until a complete sample has been retrieved or until a non transient
   // error is encountered or `Close` has been called. Note that this method does
   // NOT increment `returned_`. This is left to `GetNextTimestep` and
-  // `GetNextSample`. The returned pointer is only valid if the status is OK.
+  // `GetNextTrajectory`. The returned pointer is only valid if the status is
+  // OK.
   absl::Status PopNextSample(std::unique_ptr<Sample>* sample);
 
   // True if the workers should be shut down. This is the case when either:
@@ -372,7 +338,7 @@ class Sampler {
   std::string table_;
 
   // The maximum number of samples to fetch. Calls to `GetNextTimestep` or
-  // `GetNextSample` after `max_samples_` has been returned will result in
+  // `GetNextTrajectory` after `max_samples_` has been returned will result in
   // OutOfRangeError.
   const int64_t max_samples_;
 
@@ -407,7 +373,7 @@ class Sampler {
   internal::Queue<std::unique_ptr<Sample>> samples_;
 
   // The dtypes and shapes users expect from either `GetNextTimestep` or
-  // `GetNextSample` (whichever they plan to call).  May be absl::nullopt,
+  // `GetNextTrajectory` (whichever they plan to call).  May be absl::nullopt,
   // meaning unknown.
   const internal::DtypesAndShapes dtypes_and_shapes_;
   const internal::DtypesAndShapes dtypes_and_shapes_for_sequence_;
