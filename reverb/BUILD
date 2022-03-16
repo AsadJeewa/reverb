@@ -22,7 +22,6 @@ reverb_pytype_strict_library(
     srcs_version = "PY3",
     deps = [
         ":client",
-        ":dataset",
         ":errors",
         ":item_selectors",
         ":rate_limiters",
@@ -128,19 +127,6 @@ reverb_pytype_library(
     srcs_version = "PY3",
     strict_deps = True,
     deps = [
-        ":replay_sample",
-        "//reverb/cc/ops:gen_reverb_ops",
-    ],
-)
-
-reverb_pytype_library(
-    name = "dataset",
-    srcs = ["dataset.py"],
-    srcs_version = "PY3",
-    strict_deps = True,
-    visibility = ["//visibility:private"],
-    deps = [
-        ":client",
         ":replay_sample",
         "//reverb/cc/ops:gen_reverb_ops",
     ],
@@ -256,22 +242,6 @@ reverb_py_test(
 )
 
 reverb_py_test(
-    name = "dataset_test",
-    size = "medium",
-    srcs = ["dataset_test.py"],
-    python_version = "PY3",
-    deps = [
-        ":client",
-        ":dataset",
-        ":errors",
-        ":item_selectors",
-        ":rate_limiters",
-        ":replay_sample",
-        ":server",
-    ],
-)
-
-reverb_py_test(
     name = "timestep_dataset_test",
     srcs = ["timestep_dataset_test.py"],
     python_version = "PY3",
@@ -358,5 +328,15 @@ reverb_py_test(
         ":client",
         ":server",
         ":structured_writer",
+    ],
+)
+
+reverb_py_test(
+    name = "replay_sample_test",
+    srcs = ["replay_sample_test.py"],
+    python_version = "PY3",
+    deps = [
+        ":pybind",
+        ":replay_sample",
     ],
 )
